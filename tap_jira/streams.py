@@ -10,9 +10,16 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
 from singer_sdk import typing as th  # JSON Schema typing helpers
+from singer_sdk.exceptions import FatalAPIError
 from singer_sdk.pagination import JSONPathPaginator, OffsetPaginator
 
 from tap_jira.client import JiraStartAtPaginatedStream, JiraStream, ResumableAPIError
+from tap_jira.components import (
+    ComponentRegistry,
+    build_component_key,
+    classify_component_references,
+    normalize_identifier,
+)
 
 if sys.version_info >= (3, 12):
     from typing import override
@@ -1840,6 +1847,39 @@ class IssueStream(JiraStream[str]):
         ),
         Property("created", DateTimeType),
         Property("updated", DateTimeType),
+        Property("projectId", StringType),
+        Property("projectKey", StringType),
+        Property(
+            "componentClassifications",
+            ArrayType(
+                ObjectType(
+                    Property("componentKey", StringType),
+                    Property("componentId", StringType),
+                    Property("projectId", StringType),
+                    Property("projectKey", StringType),
+                    Property("name", StringType),
+                    Property("catalogName", StringType),
+                    Property("status", StringType),
+                    Property("reason", StringType),
+                    additional_properties=True,
+                ),
+            ),
+        ),
+        Property(
+            "unresolvedComponentReferences",
+            ArrayType(
+                ObjectType(
+                    Property("componentKey", StringType),
+                    Property("componentId", StringType),
+                    Property("projectId", StringType),
+                    Property("projectKey", StringType),
+                    Property("name", StringType),
+                    Property("self", StringType),
+                    Property("reason", StringType),
+                    additional_properties=True,
+                ),
+            ),
+        ),
     ).to_dict()
 
     @override
@@ -1895,10 +1935,28 @@ class IssueStream(JiraStream[str]):
         """Post-process the record.
 
         - Add top-level `created` field.
+        - Classify the issue's component references against the registry.
         """
         fields: dict[str, Any] = row["fields"]
         row["created"] = fields.pop("created")
         row["updated"] = fields.pop("updated")
+
+        project = fields.get("project") or {}
+        project_id = project.get("id") if isinstance(project, dict) else None
+        project_key = project.get("key") if isinstance(project, dict) else None
+
+        registry = ComponentRegistry.from_tap_state(self.tap_state)
+        classification = classify_component_references(
+            fields.get("components"),
+            registry,
+            project_id=project_id,
+            project_key=project_key,
+        )
+
+        row["projectId"] = normalize_identifier(project_id)
+        row["projectKey"] = project_key
+        row["componentClassifications"] = classification.classifications
+        row["unresolvedComponentReferences"] = classification.unresolved
         return row
 
     @override
@@ -3524,15 +3582,74 @@ class IssueWorklogs(JiraStartAtPaginatedStream):
     ).to_dict()
 
 
+class _ProjectComponentStream(JiraStartAtPaginatedStream):
+    """Components of a single project.
+
+    Unlike the account-wide ``/component`` endpoint, the project-scoped
+    endpoint returns each component's real ``projectId`` (and ``project`` key),
+    which the stream injects into the record so it is never lost.
+    """
+
+    name = "project_components"
+    path = "/project/{projectId}/component"
+    primary_keys = ("componentKey",)
+    records_jsonpath = "$[values][*]"
+    instance_name = "values"
+    state_partitioning_keys = ()
+
+    schema = th.PropertiesList(
+        th.Property("self", th.StringType),
+        th.Property("id", th.StringType),
+        th.Property("name", th.StringType),
+        th.Property("description", th.StringType),
+        th.Property("ari", th.StringType),
+        th.Property("project", th.StringType),
+        th.Property("projectId", th.StringType),
+        th.Property("assigneeType", th.StringType),
+        th.Property("realAssigneeType", th.StringType),
+        th.Property("isAssigneeTypeValid", th.BooleanType),
+        th.Property("issueCount", th.IntegerType),
+        th.Property("leadAccountId", th.StringType),
+        th.Property("metadata", th.ObjectType(additional_properties=True)),
+        th.Property("componentKey", th.StringType),
+    ).to_dict()
+
+    @override
+    def get_records(self, context: Context | None) -> Iterable[Record]:
+        """Yield this project's components, tagging each with the project ID.
+
+        The project-scoped endpoint normally returns ``projectId`` itself, but
+        injecting it from the request context guarantees that the real project
+        ID is never lost even if the payload omits it.
+        """
+        project_id = normalize_identifier((context or {}).get("projectId"))
+        for record in super().get_records(context):
+            if project_id is not None and not record.get("projectId"):
+                record["projectId"] = project_id
+            yield record
+
+
 class ComponentStream(JiraStartAtPaginatedStream):
     """Components stream.
 
-    https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-project-components/#api-rest-api-3-component-get
+    Components are collected per project so that the real ``projectId`` is
+    preserved. Every record carries a stable, project-scoped ``componentKey`` of
+    the form ``<projectId>:<componentId>``.
+
+    Component names are *not* unique across projects, so records are never
+    merged by name: the project ID is always part of the identity.
+
+    Each collected component is additionally registered in the tap state (under
+    the ``components`` bookmark) so that issues synced in the same or a later
+    batch can explain their references, including references to components that
+    were merged away or renamed.
+
+    https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-project-components/#api-rest-api-3-project-projectidorkey-component-get
     """
 
     name = "components"
-    path = "/component"
-    primary_keys = ("id",)
+    path = "/project/{projectId}/component"
+    primary_keys = ("componentKey",)
     records_jsonpath = "$[values][*]"
     instance_name = "values"
 
@@ -3541,4 +3658,55 @@ class ComponentStream(JiraStartAtPaginatedStream):
         th.Property("id", th.StringType),
         th.Property("name", th.StringType),
         th.Property("description", th.StringType),
+        th.Property("ari", th.StringType),
+        th.Property("project", th.StringType),
+        th.Property("projectId", th.StringType),
+        th.Property("assigneeType", th.StringType),
+        th.Property("realAssigneeType", th.StringType),
+        th.Property("isAssigneeTypeValid", th.BooleanType),
+        th.Property("issueCount", th.IntegerType),
+        th.Property("leadAccountId", th.StringType),
+        th.Property("metadata", th.ObjectType(additional_properties=True)),
+        th.Property("componentKey", th.StringType),
     ).to_dict()
+
+    @override
+    def get_records(self, context: Context | None) -> Iterable[Record]:
+        """Collect components for every project, one project at a time."""
+        projects = ProjectStream(self._tap)
+        for project in projects.get_records(context):
+            project_id = normalize_identifier(project.get("id"))
+            if project_id is None:
+                continue
+
+            project_context: dict[str, Any] = {
+                **(context or {}),
+                "projectId": project_id,
+            }
+            stream = _ProjectComponentStream(
+                self._tap,
+                schema=self.schema,
+            )
+            try:
+                yield from stream.get_records(project_context)
+            except FatalAPIError as exc:
+                # A single inaccessible project (e.g. archived or lacking
+                # browse permission) should not abort collection for the rest.
+                self.logger.warning(
+                    "Skipping components for project %s: %s",
+                    project_id,
+                    exc,
+                )
+
+    @override
+    def post_process(self, row: Record, context: Context | None = None) -> Record:
+        """Attach identity fields and persist the component in the registry."""
+        project_id = normalize_identifier(
+            row.get("projectId") or (context or {}).get("projectId"),
+        )
+        row["projectId"] = project_id
+        row["componentKey"] = build_component_key(project_id, row.get("id"))
+
+        registry = ComponentRegistry.from_tap_state(self.tap_state, create=True)
+        registry.remember(row)
+        return row

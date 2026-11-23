@@ -179,6 +179,35 @@ You can easily run `tap-jira` by itself or in a pipeline using [Meltano](https:/
 
 This project uses parent-child streams. Learn more about them [here](https://gitlab.com/meltano/sdk/-/blob/main/docs/parent_streams.md).
 
+## Component identity
+
+Jira component names are only unique *within* a project, and components can be
+merged or renamed over time while issues keep referencing the old component.
+The `components` stream and the `issues` stream therefore share a
+project-scoped identity model:
+
+* **`components`** is collected per project (via `/project/{projectId}/component`),
+  so every record carries the real `projectId`, its `project` key, and a stable
+  `componentKey` of the form `<projectId>:<componentId>`. The component ID is
+  stable across renames, and the project ID is always part of the key, so
+  identically named components in different projects are never merged.
+* Each component is also registered in the tap state (under the `components`
+  bookmark). Entries are kept across sync batches, which means a component that
+  is renamed or merged away between two batches can still be explained later.
+* **`issues`** adds three top-level fields:
+  * `projectId` / `projectKey` — the issue's project.
+  * `componentClassifications` — one entry per referenced component, with its
+    `componentKey`, `status` (`resolved` / `unresolved`), and, when resolved,
+    the component's name in the registry (`catalogName`).
+  * `unresolvedComponentReferences` — the references that could not be resolved
+    (for example a component merged away before it was ever collected, or a
+    reference whose project cannot be determined). Each entry keeps the raw
+    `componentId`, `name`, `self` URL, and a `reason`.
+
+References are matched by component ID only; names are never used for matching.
+Registry entries are never removed, so categories recorded in an earlier batch
+remain interpretable in later batches.
+
 ### Executing the Tap Directly
 
 ```bash
